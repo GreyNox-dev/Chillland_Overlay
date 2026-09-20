@@ -1,0 +1,2153 @@
+using System.Net.Http;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using TheIsleOverlay.Core;
+using TheIsleOverlay.LocalTelemetry;
+
+namespace TheIsleOverlay.App;
+
+public partial class MainWindow : Window
+{
+    private static readonly Uri GatewayMapResourceUri = new("Assets/GatewayMap.jpg", UriKind.Relative);
+    private static readonly Uri GatewayMapWaterResourceUri = new("Assets/GatewayMapWater.jpg", UriKind.Relative);
+    private static readonly TimeSpan LiveHeadingAnimationDuration = TimeSpan.FromMilliseconds(35);
+    private static readonly TimeSpan MovementHeadingAnimationDuration = TimeSpan.FromMilliseconds(80);
+    private static readonly TimeSpan UiRenderInterval = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan MouseShortcutActivationPollInterval = TimeSpan.FromMilliseconds(25);
+
+    private const int WmHotkey = 0x0312;
+    private const int WmInput = 0x00FF;
+    private const int GwlExStyle = -20;
+    private const int WsExTransparent = 0x00000020;
+    private const int WsExNoActivate = 0x08000000;
+
+    private static readonly SolidColorBrush OnlineBrush = BrushFrom("#37D4C6");
+    private static readonly SolidColorBrush WaitingBrush = BrushFrom("#E7B74E");
+    private static readonly SolidColorBrush ErrorBrush = BrushFrom("#DC5A56");
+
+    private readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(12) };
+    private readonly CancellationTokenSource _shutdown = new();
+    private readonly TelemetrySourceDefinition? _requestedSource;
+    private readonly string? _providedCookie;
+    private readonly ITelemetrySession? _providedSession;
+    private readonly IRemotePlayerTelemetrySource? _remotePlayerSource;
+    private readonly ILocalMovementSource? _providedLocalSource;
+    private ProFeatureAccessGrant _proFeatureAccess;
+    private readonly OverlayLayoutSettingsStore _layoutSettingsStore = new();
+    private readonly LatestValueBuffer<QueuedRenderSnapshot> _renderSnapshotBuffer = new();
+    private long _lastDiagnosticTick;
+    private MapDiagnosticWriter? _diagnosticsWriter;
+    private long _snapshotsReceived;
+    private long _snapshotsRendered;
+    private long _previousRenderTick;
+    private long _renderStartedAt;
+    private double _snapshotQueueDelayMs;
+    private double _renderIntervalMs;
+    private sealed record QueuedRenderSnapshot(TelemetrySnapshot Snapshot, long PublishedAt);
+    private ITelemetrySession? _telemetrySession;
+    private Task? _telemetryWatchTask;
+    private OverlayLayoutSettings _layoutSettings = new();
+    private string _configuredSource = "ERA";
+    private WorldLocation? _location;
+    private MapPoint? _mapLocation;
+    private WorldLocation? _previousLocation;
+    private GlobalMouseShortcutHook? _mouseShortcuts;
+    private HwndSource? _windowSource;
+    private double _mapZoom = MapZoomRules.DefaultZoom;
+    private double _mapPanStartImageWidth;
+    private double _mapPanStartImageHeight;
+    private double _mapPanStartDpiScaleX = 1d;
+    private double _mapPanStartDpiScaleY = 1d;
+    private double _mapPanRawDeltaX;
+    private double _mapPanRawDeltaY;
+    private double _headingDegrees;
+    private double? _lastAnimatedHeadingTarget;
+    private double _overlayScale = OverlayLayoutRules.DefaultScale;
+    private double _resizeStartingScale;
+    private Point _resizeStartingScreenPoint;
+    private readonly Dictionary<string, double> _widgetScales = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, bool> _widgetVisibility =
+        OverlayLayoutRules.CreateDefaultWidgetVisibility();
+    private string _mapShape = OverlayLayoutRules.SquareMapShape;
+    private FrameworkElement? _resizedWidget;
+    private double _widgetResizeStartingScale;
+    private Point _widgetResizeStartingScreenPoint;
+    private bool _clickThrough;
+    private bool _resizingOverlay;
+    private bool _hasMovementHeading;
+    private readonly ShortcutSettingsStore _shortcutSettingsStore = new();
+    private OverlayShortcutSettings _shortcutSettings = OverlayShortcutSettings.Defaults;
+    private ShortcutRegistrationManager? _shortcutRegistrationManager;
+    private bool _hudVisible = true;
+    private bool _remotePlayerSourceOwnedBySession;
+    private bool _mapPanActive;
+    private bool _rawMapPanReceived;
+    private bool _rawMouseInputRegistered;
+    private bool _mapLayerInspectorOpen;
+    private DispatcherTimer? _proFeatureExpiryTimer;
+    private DispatcherTimer? _uiRenderTimer;
+    private DispatcherTimer? _mouseShortcutActivationTimer;
+    private MapFocusMode _mapFocusMode = MapFocusMode.FollowPlayer;
+    private MapPoint? _freeMapFocus;
+    private MapPoint _mapPanStartFocus = new(0.5d, 0.5d);
+    private GlobalMousePoint _mapPanStartScreenPoint;
+    private volatile MapScreenBounds? _mapScreenBounds;
+    private FrameworkElement? _draggedWidget;
+    private Point _widgetDragStart;
+    private Point _widgetOrigin;
+
+    public MainWindow() : this(null, null, null, null, null, null, ProFeatureAccessGrant.Free)
+    {
+    }
+
+    public MainWindow(TelemetrySourceDefinition? source, string? cookieValue)
+        : this(source, cookieValue, null, null, null, null, ProFeatureAccessGrant.Free)
+    {
+    }
+
+    public MainWindow(
+        TelemetrySourceDefinition? source,
+        string? cookieValue,
+        IRemotePlayerTelemetrySource? remotePlayerSource)
+        : this(source, cookieValue, null, null, remotePlayerSource, null, ProFeatureAccessGrant.Free)
+    {
+    }
+
+    public MainWindow(
+        TelemetrySourceDefinition? source,
+        string? cookieValue,
+        IRemotePlayerTelemetrySource? remotePlayerSource,
+        ILocalMovementSource localSource)
+        : this(source, cookieValue, null, null, remotePlayerSource, localSource, ProFeatureAccessGrant.Free)
+    {
+    }
+
+    public MainWindow(ITelemetrySession telemetrySession, string displayName)
+        : this(
+            null,
+            null,
+            telemetrySession ?? throw new ArgumentNullException(nameof(telemetrySession)),
+            displayName,
+            null,
+            null,
+            ProFeatureAccessGrant.Free)
+    {
+    }
+
+    public MainWindow(
+        ITelemetrySession telemetrySession,
+        string displayName,
+        IRemotePlayerTelemetrySource? remotePlayerSource)
+        : this(
+            null,
+            null,
+            telemetrySession ?? throw new ArgumentNullException(nameof(telemetrySession)),
+            displayName,
+            remotePlayerSource,
+            null,
+            ProFeatureAccessGrant.Free)
+    {
+    }
+
+    internal MainWindow(
+        ITelemetrySession telemetrySession,
+        string displayName,
+        ProFeatureAccessGrant proFeatureAccess)
+        : this(
+            null,
+            null,
+            telemetrySession ?? throw new ArgumentNullException(nameof(telemetrySession)),
+            displayName,
+            null,
+            null,
+            proFeatureAccess)
+    {
+    }
+
+    internal MainWindow(
+        TelemetrySourceDefinition? source,
+        string? cookieValue,
+        IRemotePlayerTelemetrySource? remotePlayerSource,
+        ILocalMovementSource localSource,
+        ProFeatureAccessGrant proFeatureAccess)
+        : this(source, cookieValue, null, null, remotePlayerSource, localSource, proFeatureAccess)
+    {
+    }
+
+    private MainWindow(
+        TelemetrySourceDefinition? source,
+        string? cookieValue,
+        ITelemetrySession? telemetrySession,
+        string? displayName,
+        IRemotePlayerTelemetrySource? remotePlayerSource,
+        ILocalMovementSource? localSource,
+        ProFeatureAccessGrant proFeatureAccess)
+    {
+        _requestedSource = source;
+        _providedCookie = cookieValue;
+        _providedSession = telemetrySession;
+        _remotePlayerSource = remotePlayerSource;
+        _providedLocalSource = localSource;
+        _proFeatureAccess = proFeatureAccess;
+        if (!string.IsNullOrWhiteSpace(displayName))
+        {
+            _configuredSource = displayName;
+        }
+
+        InitializeComponent();
+        InitializeMapNotes();
+        _shortcutSettings = _shortcutSettingsStore.Load();
+        _layoutSettings = _layoutSettingsStore.Load();
+        RestoreWidgetPresentationSettings();
+        ApplyOverlayScale(_layoutSettings.Scale, persist: false);
+        ApplyMapShape(_layoutSettings.MapShape, persist: false);
+        InitializeDiagnosticsWriter();
+    }
+
+    private void InitializeDiagnosticsWriter()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable("ISLE_MAP_DIAGNOSTICS_PATH");
+        if (string.IsNullOrWhiteSpace(configuredPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var path = Path.GetFullPath(configuredPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            _diagnosticsWriter = new MapDiagnosticWriter(new StreamWriter(
+                new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite),
+                new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false)));
+            WriteMapDiagnostic("window-created", null);
+        }
+        catch
+        {
+            _diagnosticsWriter = null;
+        }
+    }
+
+    private void WriteMapDiagnostic(string stage, TelemetrySnapshot? snapshot)
+    {
+        var writer = _diagnosticsWriter;
+        if (writer is null)
+        {
+            return;
+        }
+
+        // Sample only completed frames at 4 Hz. Copy UI values here; JSON and
+        // disk writes run on a bounded background queue, not the dispatcher.
+        var diagnosticTick = Environment.TickCount64;
+        var previousDiagnosticTick = Volatile.Read(ref _lastDiagnosticTick);
+        if (!string.Equals(stage, "window-created", StringComparison.Ordinal)
+            && previousDiagnosticTick > 0
+            && diagnosticTick - previousDiagnosticTick < 250)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref _lastDiagnosticTick, diagnosticTick);
+
+        var record = new
+        {
+            ReceivedAt = DateTimeOffset.UtcNow,
+            stage,
+            EditMode = !_clickThrough,
+            OverlayActive = IsActive,
+            WpfRenderingTier = RenderCapability.Tier >> 16,
+            UiQueueDelayMs = _snapshotQueueDelayMs,
+            UiRenderIntervalMs = _renderIntervalMs,
+            UiWorkDurationMs = _renderStartedAt == 0 ? 0d
+                : Stopwatch.GetElapsedTime(_renderStartedAt).TotalMilliseconds,
+            SnapshotAgeMs = snapshot?.UpdatedAt is { } updatedAt
+                ? (double?)(DateTimeOffset.UtcNow - updatedAt).TotalMilliseconds : null,
+            SnapshotsReceived = Interlocked.Read(ref _snapshotsReceived),
+            SnapshotsRendered = _snapshotsRendered,
+            snapshot?.Source,
+            snapshot?.Success,
+            snapshot?.ServerOnline,
+            snapshot?.PlayerOnline,
+            snapshot?.SessionState,
+            snapshot?.UpdatedAt,
+            snapshot?.ProPlayerTrackingActive,
+            snapshot?.ProPlayerSequence,
+            snapshot?.ProPlayerSync,
+            snapshot?.ProPlayerCaptureHealth,
+            PlayerIdentity = snapshot?.Player is { } diagnosticPlayer
+                ? new
+                {
+                    diagnosticPlayer.SteamId,
+                    diagnosticPlayer.Name,
+                    diagnosticPlayer.Class,
+                    diagnosticPlayer.GrowthPercent,
+                    diagnosticPlayer.HealthPercent,
+                    diagnosticPlayer.StaminaPercent,
+                    diagnosticPlayer.HungerPercent,
+                    diagnosticPlayer.ThirstPercent,
+                    diagnosticPlayer.ExactVitalsSource,
+                    diagnosticPlayer.ExactVitals,
+                    diagnosticPlayer.Nutrition,
+                    diagnosticPlayer.Prime
+                }
+                : null,
+            Local = snapshot?.Player?.Location,
+            ServerEndpoint = snapshot?.Player is { } diagnosticServer
+                ? diagnosticServer.ServerEndpoint ?? diagnosticServer.Server
+                : null,
+            InputMarkerCount = snapshot?.Map?.Markers.Count ?? 0,
+            RenderedMarkerCount = _renderedRemotePlayerMarkers.Count,
+            RenderedMarkers = _renderedRemotePlayerMarkers.Select(marker => new
+            {
+                marker.Key,
+                marker.Label,
+                marker.EntityKind,
+                marker.Category,
+                marker.Point,
+                marker.IsProvisional
+            }).ToArray()
+        };
+
+        writer.Publish(record);
+    }
+
+    private async ValueTask DisposeDiagnosticsWriterAsync()
+    {
+        var writer = _diagnosticsWriter;
+        _diagnosticsWriter = null;
+        if (writer is not null)
+            await writer.DisposeAsync();
+    }
+
+    private void Window_Loaded(object sender, RoutedEventArgs e)
+    {
+        PlayerMarker.Visibility = Visibility.Collapsed;
+        DirectionNeedle.Opacity = 0.45d;
+        InitializeTeamOverlay();
+
+        var handle = new WindowInteropHelper(this).Handle;
+        _windowSource = HwndSource.FromHwnd(handle);
+        _windowSource?.AddHook(WindowMessageHook);
+        _shortcutRegistrationManager = new ShortcutRegistrationManager(
+            handle,
+            includeMapNotes: HasCurrentProFeatures);
+        var shortcutRegistration = _shortcutRegistrationManager.RegisterInitial(_shortcutSettings);
+        _shortcutSettings = shortcutRegistration.ActiveSettings;
+        StartProFeatureExpiryWatch();
+        ConfigureWorkspaceBounds();
+        RestoreWidgetLayout();
+        InstallMouseShortcuts();
+        RefreshShortcutCopy();
+        // Safety is independent from hotkey registration.  A collision must
+        // never leave this full-screen window interactive over the game.
+        SetClickThrough(OverlayInputSafetyPolicy.StartClickThrough(
+            shortcutRegistration.Success));
+        if (!shortcutRegistration.Success)
+        {
+            Dispatcher.BeginInvoke(
+                () => ShowShortcutRegistrationWarning(shortcutRegistration),
+                DispatcherPriority.Loaded);
+        }
+
+        if (!TryConfigureTelemetrySession())
+        {
+            SetConnectionState("CHƯA CẤU HÌNH NGUỒN", ErrorBrush);
+            PlayerNameLabel.Text = "Set cookie cho Era hoặc DinoVietnam";
+            MapStateLabel.Text = "CHƯA CÓ PHIÊN ĐĂNG NHẬP";
+            return;
+        }
+
+        if (_telemetrySession is not LocalPositionTelemetrySession)
+        {
+            _telemetrySession = new LocalPositionTelemetrySession(
+                _telemetrySession,
+                _providedLocalSource,
+                sourceName: _configuredSource,
+                remotePlayerSource: _remotePlayerSource);
+            _remotePlayerSourceOwnedBySession = _remotePlayerSource is not null;
+        }
+
+        StartUiRenderTimer();
+        LoadMap();
+        _telemetryWatchTask = WatchTelemetryAsync();
+    }
+
+    private bool HasCurrentProFeatures => _proFeatureAccess.IsActiveAt(DateTimeOffset.UtcNow);
+
+    private void StartProFeatureExpiryWatch()
+    {
+        _proFeatureExpiryTimer?.Stop();
+        _proFeatureExpiryTimer = null;
+        if (!HasCurrentProFeatures || _proFeatureAccess.ExpiresAt is not { } expiresAt)
+        {
+            return;
+        }
+
+        var remaining = expiresAt - DateTimeOffset.UtcNow;
+        _proFeatureExpiryTimer = new DispatcherTimer(
+            remaining <= TimeSpan.FromSeconds(30)
+                ? TimeSpan.FromMilliseconds(Math.Max(250d, remaining.TotalMilliseconds + 100d))
+                : TimeSpan.FromSeconds(30),
+            DispatcherPriority.Normal,
+            ProFeatureExpiryTimer_Tick,
+            Dispatcher);
+        _proFeatureExpiryTimer.Start();
+    }
+
+    private void ProFeatureExpiryTimer_Tick(object? sender, EventArgs e)
+    {
+        if (HasCurrentProFeatures)
+        {
+            return;
+        }
+
+        _proFeatureExpiryTimer?.Stop();
+        _proFeatureExpiryTimer = null;
+        _proFeatureAccess = ProFeatureAccessGrant.Free;
+        RebuildShortcutRegistration(includeMapNotes: false);
+        DisableProMapFeatures();
+    }
+
+    private bool TryConfigureTelemetrySession()
+    {
+        if (_providedSession is not null)
+        {
+            _telemetrySession = _providedSession;
+            return true;
+        }
+
+        if (_requestedSource is not null && !string.IsNullOrWhiteSpace(_providedCookie))
+        {
+            ConfigureTelemetrySession(_requestedSource, _providedCookie);
+            return true;
+        }
+
+        var requestedSourceId = Environment.GetEnvironmentVariable("TELEMETRY_SOURCE")?.Trim().ToLowerInvariant();
+        if (requestedSourceId == "islepilot")
+        {
+            requestedSourceId = "dinovietnam";
+        }
+
+        var source = TelemetrySourceDefinition.FromId(requestedSourceId);
+        var cookie = source?.Id switch
+        {
+            "era" => Environment.GetEnvironmentVariable("ERA_SESSION"),
+            "dinovietnampremium" => Environment.GetEnvironmentVariable("ISLEPILOT_PREMIUM_PLAYER") ??
+                                      Environment.GetEnvironmentVariable("ISLEPILOT_PLAYER"),
+            "hoho" => Environment.GetEnvironmentVariable("ISLEPILOT_HOHO_PLAYER") ??
+                      Environment.GetEnvironmentVariable("ISLEPILOT_PLAYER"),
+            "dinovietnam" => Environment.GetEnvironmentVariable("ISLEPILOT_PLAYER"),
+            "pandora" => Environment.GetEnvironmentVariable("PANDORA_SESSION"),
+            _ => null
+        };
+
+        if (source is not null && !string.IsNullOrWhiteSpace(cookie))
+        {
+            ConfigureTelemetrySession(source, cookie);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void ConfigureTelemetrySession(TelemetrySourceDefinition source, string cookieValue)
+    {
+        var provider = source.CreateProvider(_httpClient, cookieValue);
+        var interval = source.Kind == TelemetrySourceKind.Pandora
+            ? TimeSpan.FromSeconds(5)
+            : (TimeSpan?)null;
+        _telemetrySession = new PollingTelemetrySession(
+            provider,
+            interval,
+            source: source.ShortName);
+        _configuredSource = source.ShortName;
+    }
+
+    private void InstallMouseShortcuts()
+    {
+        _mouseShortcuts = new GlobalMouseShortcutHook(Dispatcher);
+        _mouseShortcuts.CanStartMapPan = CanStartMapPan;
+        _mouseShortcuts.ZoomInRequested += ZoomInMap;
+        _mouseShortcuts.ZoomOutRequested += ZoomOutMap;
+        _mouseShortcuts.ToggleMapRequested += ToggleMap;
+        _mouseShortcuts.MapPanStarted += StartMapPan;
+        _mouseShortcuts.MapPanMoved += MoveMapPan;
+        _mouseShortcuts.MapPanEnded += EndMapPan;
+        _mouseShortcuts.FollowMapRequested += FollowPlayerMap;
+        _mouseShortcutActivationTimer = new DispatcherTimer(
+            MouseShortcutActivationPollInterval,
+            DispatcherPriority.Background,
+            MouseShortcutActivationTimer_Tick,
+            Dispatcher);
+        _mouseShortcutActivationTimer.Start();
+    }
+
+    private void MouseShortcutActivationTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_mouseShortcuts is null)
+        {
+            return;
+        }
+
+        var shouldInstall = MouseShortcutActivationPolicy.ShouldInstall(
+            GlobalMouseShortcutHook.IsActivationKeyPressed(),
+            _mouseShortcuts.HasActiveGesture);
+        if (shouldInstall)
+        {
+            _mouseShortcuts.Install();
+        }
+        else
+        {
+            _mouseShortcuts.Uninstall();
+        }
+    }
+
+    private void LoadMap()
+    {
+        try
+        {
+            var resource = Application.GetResourceStream(GatewayMapResourceUri)
+                ?? throw new InvalidOperationException("Bundled Gateway map resource was not found.");
+            using var stream = resource.Stream;
+            var image = new BitmapImage();
+            image.BeginInit();
+            image.CacheOption = BitmapCacheOption.OnLoad;
+            image.StreamSource = stream;
+            image.EndInit();
+            image.Freeze();
+            MapImage.Source = image;
+            _baseMapImage = image;
+            _waterMapImage = LoadBitmapResource(GatewayMapWaterResourceUri);
+            InitializeMapLayers();
+            ApplyWaterMapImage();
+            MapStateLabel.Visibility = Visibility.Collapsed;
+            PositionMap();
+        }
+        catch
+        {
+            MapStateLabel.Text = "KHÔNG ĐỌC ĐƯỢC BẢN ĐỒ";
+        }
+    }
+
+    private async Task WatchTelemetryAsync()
+    {
+        if (_telemetrySession is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await foreach (var snapshot in _telemetrySession
+                               .WatchAsync(_shutdown.Token)
+                               .ConfigureAwait(false))
+            {
+                QueueRenderSnapshot(snapshot);
+            }
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+            await Dispatcher.InvokeAsync(() =>
+                ShowTelemetryUnavailable("MẤT KẾT NỐI", "Telemetry session đã dừng"));
+        }
+    }
+
+    private void QueueRenderSnapshot(TelemetrySnapshot snapshot)
+    {
+        Interlocked.Increment(ref _snapshotsReceived);
+        _renderSnapshotBuffer.Publish(new QueuedRenderSnapshot(snapshot, Stopwatch.GetTimestamp()));
+    }
+
+    private void StartUiRenderTimer()
+    {
+        if (_uiRenderTimer is not null)
+        {
+            return;
+        }
+
+        _uiRenderTimer = new DispatcherTimer(DispatcherPriority.Normal, Dispatcher)
+        {
+            Interval = UiRenderInterval
+        };
+        _uiRenderTimer.Tick += UiRenderTimer_Tick;
+        _uiRenderTimer.Start();
+    }
+
+    private void UiRenderTimer_Tick(object? sender, EventArgs e)
+    {
+        if (WindowState == WindowState.Minimized
+            || !_renderSnapshotBuffer.TryTake(out var queued))
+        {
+            return;
+        }
+
+        try
+        {
+            var now = Stopwatch.GetTimestamp();
+            _snapshotQueueDelayMs = Stopwatch.GetElapsedTime(queued.PublishedAt, now).TotalMilliseconds;
+            _renderIntervalMs = _previousRenderTick == 0 ? 0d
+                : Stopwatch.GetElapsedTime(_previousRenderTick, now).TotalMilliseconds;
+            _previousRenderTick = now;
+            _snapshotsRendered++;
+            RenderSnapshot(queued.Snapshot);
+        }
+        catch
+        {
+            ShowTelemetryUnavailable("MẤT KẾT NỐI", "Telemetry session đã dừng");
+        }
+    }
+
+    private void RenderSnapshot(TelemetrySnapshot snapshot)
+    {
+        _renderStartedAt = Stopwatch.GetTimestamp();
+        try
+        {
+            if (snapshot.SessionState == TelemetrySessionState.AuthenticationRequired)
+            {
+                ShowTelemetryUnavailable("PHIÊN ĐÃ HẾT HẠN", "Đăng nhập lại đúng website nguồn để tiếp tục");
+                return;
+            }
+
+            if (snapshot.SessionState == TelemetrySessionState.UnsupportedServer)
+            {
+                ShowNoActiveDinosaur(
+                    snapshot.StatusMessage ?? "ISLEPILOT · CHƯA VÀO SERVER HỖ TRỢ",
+                    "Server hiện tại chưa cài IslePilot");
+                return;
+            }
+
+            if (!snapshot.Success || !snapshot.ServerOnline)
+            {
+                ShowTelemetryUnavailable("SERVER OFFLINE", "Nguồn telemetry đang ngoại tuyến");
+                return;
+            }
+
+            if (!snapshot.PlayerOnline || snapshot.Player is null)
+            {
+                var state = ConnectionText(snapshot.SessionState);
+                var detail = snapshot.SessionState switch
+                {
+                    TelemetrySessionState.Connecting => "Đang khởi tạo phiên telemetry",
+                    TelemetrySessionState.Reconnecting => "Mất kết nối, đang thử lại",
+                    TelemetrySessionState.Stale => "Dữ liệu realtime đã quá hạn",
+                    _ => $"Join server {_configuredSource} để nhận telemetry"
+                };
+                ShowNoActiveDinosaur(state, detail);
+                return;
+            }
+
+            var player = snapshot.Player;
+            var exact = player.ExactVitals;
+
+            var degraded = snapshot.SessionState is TelemetrySessionState.Reconnecting or TelemetrySessionState.Stale;
+            SetTelemetryOpacity(degraded ? 0.58d : 1d);
+            SetConnectionState(
+                ConnectionText(snapshot.SessionState, player.ExactVitalsSource),
+                degraded ? WaitingBrush : OnlineBrush);
+            SpeciesLabel.Text = FriendlySpecies(player.Class);
+            PlayerNameLabel.Text = string.IsNullOrWhiteSpace(player.Name) ? "ACTIVE PLAYER" : player.Name;
+
+            var growth = exact?.Growth ?? player.GrowthPercent;
+            GrowthLabel.Text = growth is null
+                ? "—"
+                : $"{NormalizePercent(growth):0.#}%";
+
+            RenderVital(HealthBar, HealthValue, exact?.Health, exact?.MaxHealth, player.HealthPercent);
+            RenderVital(StaminaBar, StaminaValue, exact?.Stamina, exact?.MaxStamina, player.StaminaPercent);
+
+            RenderVital(HungerBar, HungerValue, exact?.Hunger, exact?.MaxHunger, player.HungerPercent);
+            RenderVital(WaterBar, WaterValue, exact?.Thirst, exact?.MaxThirst, player.ThirstPercent);
+            RenderPrimeMissions(player.Prime);
+
+            UpdatedLabel.Text = $"SYNC {(snapshot.UpdatedAt ?? DateTimeOffset.Now).ToLocalTime():HH:mm:ss}";
+
+            var mapPositionChanged = !Equals(_location, player.Location)
+                                     || _mapLocation != player.MapLocation;
+            UpdateHeading(player);
+            _location = player.Location;
+            _mapLocation = player.MapLocation;
+            UpdateMapNotesPlayer();
+            var remoteMarkersChanged = SyncRemotePlayerMarkers(snapshot);
+
+            var markerVisibility = ResolvePlayerMapPoint() is null
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+            var markerVisibilityChanged = PlayerMarker.Visibility != markerVisibility;
+            PlayerMarker.Visibility = markerVisibility;
+            if (MapRenderInvalidationPolicy.ShouldPositionMap(
+                    mapPositionChanged,
+                    heatmapChanged: false,
+                    remoteMarkersChanged,
+                    markerVisibilityChanged))
+            {
+                PositionMap();
+            }
+        }
+        finally
+        {
+            // Connecting/failure paths clear markers, but diagnostics must
+            // remain visible even before the first GPS fix.
+            if (HasCurrentProFeatures)
+                UpdateRemoteTrackingStatus(snapshot);
+            PublishTeamTelemetry(snapshot);
+            WriteMapDiagnostic("render-end", snapshot);
+        }
+    }
+
+    private void UpdateHeading(PlayerTelemetry player)
+    {
+        if (player.ExactMapHeadingDegrees is not null)
+        {
+            _headingDegrees = MapHeading.Normalize(player.ExactMapHeadingDegrees.Value);
+            AnimateHeadingTo(_headingDegrees, LiveHeadingAnimationDuration);
+            _hasMovementHeading = true;
+            DirectionNeedle.Opacity = 1d;
+            HeadingModeLabel.Text = $"HEADING · {_headingDegrees:000}° SERVER";
+            _previousLocation = player.Location;
+            return;
+        }
+
+        UpdateMovementHeading(player.Location);
+    }
+
+    private void UpdateMovementHeading(WorldLocation? current)
+    {
+        if (current is null)
+        {
+            _previousLocation = null;
+            return;
+        }
+
+        if (_previousLocation is not null && MovementHeading.TryCalculate(_previousLocation, current, out var measuredHeading))
+        {
+            _headingDegrees = _hasMovementHeading
+                ? MovementHeading.Smooth(_headingDegrees, measuredHeading, 0.72d)
+                : measuredHeading;
+            AnimateHeadingTo(_headingDegrees, MovementHeadingAnimationDuration);
+            _hasMovementHeading = true;
+            DirectionNeedle.Opacity = 1d;
+            HeadingModeLabel.Text = $"COURSE · {_headingDegrees:000}° / 2S";
+        }
+        else if (!_hasMovementHeading)
+        {
+            HeadingModeLabel.Text = "COURSE · WAITING";
+        }
+
+        _previousLocation = current;
+    }
+
+    private void AnimateHeadingTo(double targetDegrees, TimeSpan duration)
+    {
+        var target = MapHeading.Normalize(targetDegrees);
+        if (_hasMovementHeading
+            && !OverlayRenderWorkPolicy.HeadingChanged(_lastAnimatedHeadingTarget, target))
+        {
+            return;
+        }
+        _lastAnimatedHeadingTarget = target;
+        if (!_hasMovementHeading)
+        {
+            PlayerHeadingTransform.BeginAnimation(RotateTransform.AngleProperty, null);
+            PlayerHeadingTransform.Angle = target;
+            return;
+        }
+
+        var current = PlayerHeadingTransform.Angle;
+        var currentNormalized = MapHeading.Normalize(current);
+        var shortestDelta = (target - currentNormalized + 540d) % 360d - 180d;
+        var animation = new DoubleAnimation
+        {
+            From = current,
+            To = current + shortestDelta,
+            Duration = duration,
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+            FillBehavior = FillBehavior.HoldEnd
+        };
+        PlayerHeadingTransform.BeginAnimation(
+            RotateTransform.AngleProperty,
+            animation,
+            HandoffBehavior.SnapshotAndReplace);
+    }
+
+    private static void RenderVital(System.Windows.Controls.ProgressBar bar, System.Windows.Controls.TextBlock label, double? current, double? maximum, double? fallback)
+    {
+        if (current is null && maximum is null && fallback is null)
+        {
+            bar.Value = 0d;
+            label.Text = "—";
+            return;
+        }
+
+        var percent = VitalMath.Percent(current, maximum, fallback);
+        bar.Value = percent;
+        label.Text = current is not null && maximum is > 0
+            ? $"{FormatNumber(current.Value)} / {FormatNumber(maximum.Value)}"
+            : current is not null
+                ? FormatNumber(current.Value)
+            : $"{percent:0.#}%";
+    }
+
+    private void ClearVitals()
+    {
+        HealthBar.Value = StaminaBar.Value = HungerBar.Value = WaterBar.Value = 0;
+        HealthValue.Text = StaminaValue.Text = HungerValue.Text = WaterValue.Text = "— / —";
+        GrowthLabel.Text = "—";
+        CoordinateLabel.Text = "X —  Y —  Z —";
+        UpdatedLabel.Text = "—";
+    }
+
+    private void ShowTelemetryUnavailable(string connectionState, string detail)
+    {
+        SetTelemetryOpacity(1d);
+        SetConnectionState(connectionState, ErrorBrush);
+        SpeciesLabel.Text = "TELEMETRY UNAVAILABLE";
+        PlayerNameLabel.Text = detail;
+        _location = null;
+        _mapLocation = null;
+        _previousLocation = null;
+        _hasMovementHeading = false;
+        ClearRemotePlayerMarkers();
+        ClearPlayerHeatmap();
+        PlayerMarker.Visibility = Visibility.Collapsed;
+        HeadingModeLabel.Text = "COURSE · WAITING";
+        ClearVitals();
+        ClearPrimeMissions();
+        PositionMap();
+    }
+
+    private void ShowNoActiveDinosaur(string connectionState, string detail)
+    {
+        SetTelemetryOpacity(1d);
+        SetConnectionState(connectionState, WaitingBrush);
+        SpeciesLabel.Text = "NO ACTIVE DINOSAUR";
+        PlayerNameLabel.Text = detail;
+        _location = null;
+        _mapLocation = null;
+        _previousLocation = null;
+        _hasMovementHeading = false;
+        ClearRemotePlayerMarkers();
+        ClearPlayerHeatmap();
+        PlayerMarker.Visibility = Visibility.Collapsed;
+        HeadingModeLabel.Text = "COURSE · WAITING";
+        ClearVitals();
+        ClearPrimeMissions();
+        PositionMap();
+    }
+
+    private string ConnectionText(
+        TelemetrySessionState state,
+        string? directVitalsSource = null)
+    {
+        var source = string.IsNullOrWhiteSpace(directVitalsSource)
+            ? _configuredSource
+            : directVitalsSource.Trim();
+        return state switch
+        {
+            TelemetrySessionState.Live => $"{source} · LIVE",
+            TelemetrySessionState.Reconnecting => $"{source} · RECONNECTING",
+            TelemetrySessionState.Stale => $"{source} · DATA STALE",
+            TelemetrySessionState.Polling => $"{source} · POLL 2S",
+            _ => $"{source} · {state.ToString().ToUpperInvariant()}"
+        };
+    }
+
+    private void SetTelemetryOpacity(double opacity)
+    {
+        PlayerMarker.Opacity = opacity;
+        MapHeatmapLayer.Opacity = opacity;
+        RemotePlayerMarkerLayer.Opacity = opacity;
+        HealthBar.Opacity = StaminaBar.Opacity = HungerBar.Opacity = WaterBar.Opacity = opacity;
+        HealthValue.Opacity = StaminaValue.Opacity = HungerValue.Opacity = WaterValue.Opacity = opacity;
+        GrowthLabel.Opacity = CoordinateLabel.Opacity = opacity;
+    }
+
+    private void PositionMap()
+    {
+        if (WindowState == WindowState.Minimized
+            || !OverlayWidgetVisibilityPolicy.ShouldPositionMap(
+                _hudVisible,
+                MapPanel.Visibility == Visibility.Visible))
+        {
+            _mapScreenBounds = null;
+            return;
+        }
+
+        var viewportWidth = MapViewport.ActualWidth;
+        var viewportHeight = MapViewport.ActualHeight;
+        if (viewportWidth <= 0 || viewportHeight <= 0)
+        {
+            _mapScreenBounds = null;
+            return;
+        }
+
+        MapShade.Width = viewportWidth;
+        MapShade.Height = viewportHeight;
+
+        if (MapImage.Source is not BitmapSource source || source.PixelWidth <= 0 || source.PixelHeight <= 0)
+        {
+            _mapScreenBounds = null;
+            return;
+        }
+
+        var coverScale = Math.Max(viewportWidth / source.PixelWidth, viewportHeight / source.PixelHeight);
+        var imageWidth = source.PixelWidth * coverScale * _mapZoom;
+        var imageHeight = source.PixelHeight * coverScale * _mapZoom;
+        MapImage.Width = imageWidth;
+        MapImage.Height = imageHeight;
+
+        var playerPoint = ResolvePlayerMapPoint();
+        var anchorPoint = playerPoint ?? new MapPoint(0.5d, 0.5d);
+        var focusPoint = _mapFocusMode == MapFocusMode.FollowPlayer
+            ? MapPanRules.ClampFocus(anchorPoint, viewportWidth, viewportHeight, imageWidth, imageHeight)
+            : MapPanRules.ClampFocus(
+                _freeMapFocus ?? anchorPoint,
+                viewportWidth,
+                viewportHeight,
+                imageWidth,
+                imageHeight);
+        if (_mapFocusMode == MapFocusMode.FreeLook)
+        {
+            _freeMapFocus = focusPoint;
+        }
+        var desiredLeft = viewportWidth / 2d - focusPoint.Left * imageWidth;
+        var desiredTop = viewportHeight / 2d - focusPoint.Top * imageHeight;
+        var left = ClampImageOffset(desiredLeft, viewportWidth, imageWidth);
+        var top = ClampImageOffset(desiredTop, viewportHeight, imageHeight);
+        Canvas.SetLeft(MapImage, left);
+        Canvas.SetTop(MapImage, top);
+
+        Canvas.SetLeft(PlayerMarker, left + anchorPoint.Left * imageWidth - PlayerMarker.Width / 2d);
+        Canvas.SetTop(PlayerMarker, top + anchorPoint.Top * imageHeight - PlayerMarker.Height / 2d);
+        PositionMapLayers(left, top, imageWidth, imageHeight);
+        PositionRemotePlayerMarkers(left, top, imageWidth, imageHeight);
+        PositionTeamMarkers(left, top, imageWidth, imageHeight);
+        PositionMapNotes(playerPoint, left, top, imageWidth, imageHeight);
+        UpdateMapFocusIndicator();
+        UpdateMapScreenBounds();
+    }
+
+    private MapPoint? ResolvePlayerMapPoint()
+        => GatewayMapProjection.ResolveForBundledTexture(_location, _mapLocation);
+
+    private static double ClampImageOffset(double desired, double viewportSize, double imageSize) =>
+        imageSize <= viewportSize ? (viewportSize - imageSize) / 2d : Math.Clamp(desired, viewportSize - imageSize, 0d);
+
+    private bool CanStartMapPan(GlobalMousePoint point)
+    {
+        var bounds = _mapScreenBounds;
+        return bounds?.Contains(point) == true;
+    }
+
+    private void StartMapPan(GlobalMousePoint point)
+    {
+        if (!CanStartMapPan(point)
+            || !double.IsFinite(MapImage.Width)
+            || !double.IsFinite(MapImage.Height)
+            || MapImage.Width <= 0d
+            || MapImage.Height <= 0d)
+        {
+            return;
+        }
+
+        var dpi = VisualTreeHelper.GetDpi(MapViewport);
+        _mapPanStartDpiScaleX = Math.Max(0.01d, dpi.DpiScaleX);
+        _mapPanStartDpiScaleY = Math.Max(0.01d, dpi.DpiScaleY);
+        _mapPanStartImageWidth = MapImage.Width;
+        _mapPanStartImageHeight = MapImage.Height;
+        var anchorPoint = ResolvePlayerMapPoint() ?? new MapPoint(0.5d, 0.5d);
+        _mapPanStartFocus = _mapFocusMode == MapFocusMode.FreeLook && _freeMapFocus is { } freeFocus
+            ? MapPanRules.ClampFocus(
+                freeFocus,
+                MapViewport.ActualWidth,
+                MapViewport.ActualHeight,
+                MapImage.Width,
+                MapImage.Height)
+            : MapPanRules.ClampFocus(
+                anchorPoint,
+                MapViewport.ActualWidth,
+                MapViewport.ActualHeight,
+                MapImage.Width,
+                MapImage.Height);
+        _mapPanRawDeltaX = 0d;
+        _mapPanRawDeltaY = 0d;
+        _rawMapPanReceived = false;
+        _freeMapFocus = _mapPanStartFocus;
+        _mapFocusMode = MapFocusMode.FreeLook;
+        _mapPanStartScreenPoint = point;
+        _mapPanActive = true;
+        EnableRawMouseInput();
+        MapPanel.Cursor = Cursors.Hand;
+        UpdateMapFocusIndicator();
+    }
+
+    private void MoveMapPan(GlobalMousePoint point)
+    {
+        if (!_mapPanActive || _rawMapPanReceived)
+        {
+            return;
+        }
+
+        var horizontalDelta = (point.X - _mapPanStartScreenPoint.X) / _mapPanStartDpiScaleX;
+        var verticalDelta = (point.Y - _mapPanStartScreenPoint.Y) / _mapPanStartDpiScaleY;
+        ApplyMapPanDelta(horizontalDelta, verticalDelta);
+    }
+
+    private void MoveMapPan(RawMouseDelta delta)
+    {
+        if (!_mapPanActive)
+        {
+            return;
+        }
+
+        _rawMapPanReceived = true;
+        _mapPanRawDeltaX += delta.X / _mapPanStartDpiScaleX;
+        _mapPanRawDeltaY += delta.Y / _mapPanStartDpiScaleY;
+        ApplyMapPanDelta(_mapPanRawDeltaX, _mapPanRawDeltaY);
+    }
+
+    private void ApplyMapPanDelta(double horizontalDelta, double verticalDelta)
+    {
+        var requestedFocus = MapPanRules.ApplyDragToFocus(
+            _mapPanStartFocus,
+            horizontalDelta,
+            verticalDelta,
+            _mapPanStartImageWidth,
+            _mapPanStartImageHeight);
+        _freeMapFocus = MapPanRules.ClampFocus(
+            requestedFocus,
+            MapViewport.ActualWidth,
+            MapViewport.ActualHeight,
+            MapImage.Width,
+            MapImage.Height);
+        PositionMap();
+    }
+
+    private void EndMapPan(GlobalMousePoint point)
+    {
+        if (!_rawMapPanReceived)
+        {
+            MoveMapPan(point);
+        }
+        _mapPanActive = false;
+        DisableRawMouseInput();
+        MapPanel.Cursor = _clickThrough ? Cursors.Arrow : Cursors.SizeAll;
+    }
+
+    private void EnableRawMouseInput()
+    {
+        if (_rawMouseInputRegistered)
+        {
+            return;
+        }
+
+        _rawMouseInputRegistered = RawMouseInput.TryRegister(
+            new WindowInteropHelper(this).Handle);
+    }
+
+    private void DisableRawMouseInput()
+    {
+        if (!_rawMouseInputRegistered)
+        {
+            return;
+        }
+
+        _ = RawMouseInput.TryUnregister();
+        _rawMouseInputRegistered = false;
+    }
+
+    private void CancelMapPan()
+    {
+        _mapPanActive = false;
+        _rawMapPanReceived = false;
+        DisableRawMouseInput();
+        MapPanel.Cursor = _clickThrough ? Cursors.Arrow : Cursors.SizeAll;
+    }
+
+    private void FollowPlayerMap()
+    {
+        CancelMapPan();
+        _mapFocusMode = MapFocusMode.FollowPlayer;
+        _freeMapFocus = null;
+        UpdateMapFocusIndicator();
+        PositionMap();
+    }
+
+    private void UpdateMapFocusIndicator()
+    {
+        if (MapFocusModeButton is null)
+        {
+            return;
+        }
+
+        var freeLook = _mapFocusMode == MapFocusMode.FreeLook;
+        MapFocusModeButton.Content = freeLook ? "FREE · ALT+RMB" : "FOLLOW · GPS";
+        MapFocusModeButton.Foreground = freeLook ? BrushFrom("#F4CB69") : BrushFrom("#72E4D8");
+        MapFocusModeButton.BorderBrush = freeLook ? BrushFrom("#A8E7B74E") : BrushFrom("#8A37D4C6");
+        MapFocusModeButton.ToolTip = freeLook
+            ? "GPS vẫn cập nhật nhưng map đang đứng yên. ALT + chuột phải để bám GPS lại."
+            : "Map tự bám theo GPS. ALT + kéo chuột trái để quan sát tự do.";
+    }
+
+    private void UpdateMapScreenBounds()
+    {
+        if (!IsLoaded
+            || !_hudVisible
+            || WindowState == WindowState.Minimized
+            || MapPanel.Visibility != Visibility.Visible
+            || MapImage.Source is null)
+        {
+            _mapScreenBounds = null;
+            return;
+        }
+
+        try
+        {
+            var topLeft = MapViewport.PointToScreen(new Point(0d, 0d));
+            var bottomRight = MapViewport.PointToScreen(
+                new Point(MapViewport.ActualWidth, MapViewport.ActualHeight));
+            var bounds = new MapScreenBounds(
+                Math.Min(topLeft.X, bottomRight.X),
+                Math.Min(topLeft.Y, bottomRight.Y),
+                Math.Max(topLeft.X, bottomRight.X),
+                Math.Max(topLeft.Y, bottomRight.Y));
+            _mapScreenBounds = bounds.Width > 1d && bounds.Height > 1d ? bounds : null;
+        }
+        catch (InvalidOperationException)
+        {
+            _mapScreenBounds = null;
+        }
+    }
+
+    private void SetConnectionState(string text, Brush brush)
+    {
+        ConnectionLabel.Text = text;
+        ConnectionDot.Fill = brush;
+    }
+
+    private static double NormalizePercent(double? value)
+    {
+        if (value is null) return 0d;
+        return Math.Clamp(value.Value is >= 0d and <= 1d ? value.Value * 100d : value.Value, 0d, 100d);
+    }
+
+    private static string FriendlySpecies(string? className)
+    {
+        if (string.IsNullOrWhiteSpace(className)) return "ACTIVE DINOSAUR";
+        var value = className.Replace("BP_", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Replace("_C", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Replace("Character", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Trim('_', ' ');
+        return value.Replace('_', ' ').ToUpperInvariant();
+    }
+
+    private static string FormatNumber(double value) => Math.Abs(value) >= 100d ? value.ToString("0") : value.ToString("0.#");
+
+    private static SolidColorBrush BrushFrom(string color)
+    {
+        var brush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(color));
+        brush.Freeze();
+        return brush;
+    }
+
+    private static T? FindAncestor<T>(DependencyObject? source) where T : DependencyObject
+    {
+        while (source is not null)
+        {
+            if (source is T match) return match;
+            source = VisualTreeHelper.GetParent(source);
+        }
+        return null;
+    }
+
+    private void MapViewport_SizeChanged(object sender, SizeChangedEventArgs e) => PositionMap();
+
+    private void ZoomInMap()
+    {
+        _mapZoom = MapZoomRules.ZoomIn(_mapZoom);
+        PositionMap();
+    }
+
+    private void ZoomOutMap()
+    {
+        _mapZoom = MapZoomRules.ZoomOut(_mapZoom);
+        PositionMap();
+    }
+
+    private void ToggleMap()
+    {
+        ToggleWidgetPreference(OverlayLayoutRules.MapWidget);
+    }
+
+    private void ZoomInButton_Click(object sender, RoutedEventArgs e) => ZoomInMap();
+
+    private void ZoomOutButton_Click(object sender, RoutedEventArgs e) => ZoomOutMap();
+
+    private void MapFocusModeButton_Click(object sender, RoutedEventArgs e) => FollowPlayerMap();
+
+    private FrameworkElement[] WidgetPanels =>
+        [MapPanel, StatsPanel, TeamPanel, MissionPanel, LayoutControls];
+
+    private FrameworkElement[] ResizableWidgetPanels =>
+        [MapPanel, StatsPanel, TeamPanel, MissionPanel];
+
+    private Thumb[] WidgetResizeGrips =>
+        [MapResizeGrip, StatsResizeGrip, TeamResizeGrip, MissionResizeGrip];
+
+    private void RestoreWidgetPresentationSettings()
+    {
+        _widgetVisibility.Clear();
+        foreach (var pair in OverlayLayoutRules.CreateDefaultWidgetVisibility())
+        {
+            _widgetVisibility[pair.Key] = pair.Value;
+        }
+        foreach (var pair in _layoutSettings.WidgetVisibility
+                     ?? new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase))
+        {
+            if (OverlayLayoutRules.IsConfigurableWidget(pair.Key))
+            {
+                _widgetVisibility[pair.Key.Trim().ToLowerInvariant()] = pair.Value;
+            }
+        }
+        RefreshWidgetVisibilityToggleStates();
+        foreach (var widget in ResizableWidgetPanels)
+        {
+            var id = WidgetId(widget);
+            _widgetScales[id] = _layoutSettings.Widgets.TryGetValue(id, out var saved)
+                ? OverlayLayoutRules.NormalizeScale(saved.Scale)
+                : OverlayLayoutRules.DefaultScale;
+        }
+
+        _mapShape = OverlayLayoutRules.NormalizeMapShape(_layoutSettings.MapShape);
+    }
+
+    private string WidgetId(FrameworkElement widget)
+    {
+        if (ReferenceEquals(widget, MapPanel)) return OverlayLayoutRules.MapWidget;
+        if (ReferenceEquals(widget, StatsPanel)) return OverlayLayoutRules.StatsWidget;
+        if (ReferenceEquals(widget, TeamPanel)) return OverlayLayoutRules.TeamWidget;
+        if (ReferenceEquals(widget, MissionPanel)) return OverlayLayoutRules.PrimeWidget;
+        if (ReferenceEquals(widget, LayoutControls)) return OverlayLayoutRules.ControlsWidget;
+        throw new ArgumentException("Unknown overlay widget.", nameof(widget));
+    }
+
+    private FrameworkElement? WidgetFromId(string? id) =>
+        id?.Trim().ToLowerInvariant() switch
+        {
+            OverlayLayoutRules.MapWidget => MapPanel,
+            OverlayLayoutRules.StatsWidget => StatsPanel,
+            OverlayLayoutRules.TeamWidget => TeamPanel,
+            OverlayLayoutRules.PrimeWidget => MissionPanel,
+            _ => null
+        };
+
+    private double WidgetScale(FrameworkElement widget) =>
+        _widgetScales.TryGetValue(WidgetId(widget), out var scale)
+            ? OverlayLayoutRules.NormalizeScale(scale)
+            : OverlayLayoutRules.DefaultScale;
+
+    private double EffectiveWidgetScale(FrameworkElement widget) =>
+        _overlayScale * WidgetScale(widget);
+
+    private void WidgetPanel_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (_clickThrough
+            || e.ButtonState != MouseButtonState.Pressed
+            || sender is not FrameworkElement widget
+            || (ReferenceEquals(widget, MapPanel) && (Keyboard.Modifiers & ModifierKeys.Alt) != 0)
+            || FindAncestor<ButtonBase>(e.OriginalSource as DependencyObject) is not null
+            || FindAncestor<Thumb>(e.OriginalSource as DependencyObject) is not null)
+        {
+            return;
+        }
+
+        _draggedWidget = widget;
+        _widgetDragStart = e.GetPosition(WidgetCanvas);
+        _widgetOrigin = new Point(
+            FiniteCanvasCoordinate(Canvas.GetLeft(widget)),
+            FiniteCanvasCoordinate(Canvas.GetTop(widget)));
+        Panel.SetZIndex(widget, 80);
+        widget.CaptureMouse();
+        e.Handled = true;
+    }
+
+    private void WidgetPanel_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (_draggedWidget is null || e.LeftButton != MouseButtonState.Pressed)
+        {
+            return;
+        }
+
+        var current = e.GetPosition(WidgetCanvas);
+        MoveWidget(
+            _draggedWidget,
+            _widgetOrigin.X + current.X - _widgetDragStart.X,
+            _widgetOrigin.Y + current.Y - _widgetDragStart.Y,
+            snap: true);
+        e.Handled = true;
+    }
+
+    private void WidgetPanel_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (_draggedWidget is null)
+        {
+            return;
+        }
+
+        var movedMap = ReferenceEquals(_draggedWidget, MapPanel);
+        _draggedWidget.ReleaseMouseCapture();
+        Panel.SetZIndex(_draggedWidget, 0);
+        _draggedWidget = null;
+        SaveOverlayLayout();
+        if (movedMap)
+        {
+            PositionMap();
+        }
+        e.Handled = true;
+    }
+
+    private void ScaleDownButton_Click(object sender, RoutedEventArgs e) =>
+        ApplyOverlayScale(_overlayScale - OverlayLayoutRules.ButtonStep, persist: true);
+
+    private void ScaleResetButton_Click(object sender, RoutedEventArgs e) =>
+        ApplyOverlayScale(OverlayLayoutRules.DefaultScale, persist: true);
+
+    private void ScaleUpButton_Click(object sender, RoutedEventArgs e) =>
+        ApplyOverlayScale(_overlayScale + OverlayLayoutRules.ButtonStep, persist: true);
+
+    private void ResizeGrip_DragStarted(object sender, DragStartedEventArgs e)
+    {
+        _resizeStartingScale = _overlayScale;
+        _resizeStartingScreenPoint = PointToScreen(Mouse.GetPosition(this));
+        _resizingOverlay = true;
+    }
+
+    private void ResizeGrip_DragDelta(object sender, DragDeltaEventArgs e)
+    {
+        if (!_resizingOverlay)
+        {
+            return;
+        }
+
+        var current = PointToScreen(Mouse.GetPosition(this));
+        var dpiScale = Math.Max(0.01d, VisualTreeHelper.GetDpi(this).DpiScaleX);
+        var deltaDip = (current.X - _resizeStartingScreenPoint.X) / dpiScale;
+        ApplyOverlayScale(
+            OverlayLayoutRules.ScaleFromHorizontalDrag(_resizeStartingScale, deltaDip),
+            persist: false);
+    }
+
+    private void ResizeGrip_DragCompleted(object sender, DragCompletedEventArgs e)
+    {
+        _resizingOverlay = false;
+        SaveOverlayLayout();
+    }
+
+    private void WidgetResizeGrip_DragStarted(object sender, DragStartedEventArgs e)
+    {
+        if (_clickThrough || sender is not Thumb { Tag: string id })
+        {
+            return;
+        }
+
+        var widget = WidgetFromId(id);
+        if (widget is null)
+        {
+            return;
+        }
+
+        _resizedWidget = widget;
+        _widgetResizeStartingScale = WidgetScale(widget);
+        _widgetResizeStartingScreenPoint = PointToScreen(Mouse.GetPosition(this));
+        Panel.SetZIndex(widget, 80);
+        e.Handled = true;
+    }
+
+    private void WidgetResizeGrip_DragDelta(object sender, DragDeltaEventArgs e)
+    {
+        if (_resizedWidget is null)
+        {
+            return;
+        }
+
+        var current = PointToScreen(Mouse.GetPosition(this));
+        var dpi = VisualTreeHelper.GetDpi(this);
+        var horizontalDeltaDip = (current.X - _widgetResizeStartingScreenPoint.X) /
+                                 Math.Max(0.01d, dpi.DpiScaleX);
+        var verticalDeltaDip = (current.Y - _widgetResizeStartingScreenPoint.Y) /
+                               Math.Max(0.01d, dpi.DpiScaleY);
+        ApplyWidgetScale(
+            _resizedWidget,
+            OverlayLayoutRules.ScaleFromWidgetDrag(
+                _widgetResizeStartingScale,
+                horizontalDeltaDip,
+                verticalDeltaDip));
+        e.Handled = true;
+    }
+
+    private void WidgetResizeGrip_DragCompleted(object sender, DragCompletedEventArgs e)
+    {
+        FinishWidgetResize(persist: true);
+        e.Handled = true;
+    }
+
+    private void ApplyWidgetScale(FrameworkElement widget, double scale)
+    {
+        _widgetScales[WidgetId(widget)] = OverlayLayoutRules.NormalizeScale(scale);
+        var effectiveScale = EffectiveWidgetScale(widget);
+        widget.LayoutTransform = new ScaleTransform(effectiveScale, effectiveScale);
+        OverlayScaleRoot.InvalidateMeasure();
+        InvalidateMeasure();
+
+        if (IsLoaded)
+        {
+            UpdateLayout();
+            MoveWidget(
+                widget,
+                FiniteCanvasCoordinate(Canvas.GetLeft(widget)),
+                FiniteCanvasCoordinate(Canvas.GetTop(widget)),
+                snap: false);
+            if (ReferenceEquals(widget, MapPanel))
+            {
+                PositionMap();
+            }
+        }
+    }
+
+    private void FinishWidgetResize(bool persist)
+    {
+        if (_resizedWidget is null)
+        {
+            return;
+        }
+
+        var resized = _resizedWidget;
+        _resizedWidget = null;
+        foreach (var grip in WidgetResizeGrips.Where(grip => grip.IsDragging))
+        {
+            grip.CancelDrag();
+        }
+        Panel.SetZIndex(resized, 0);
+        if (persist)
+        {
+            SaveOverlayLayout();
+        }
+    }
+
+    private void FinishOverlayResize()
+    {
+        if (!_resizingOverlay)
+        {
+            return;
+        }
+
+        _resizingOverlay = false;
+        if (ResizeGrip.IsDragging)
+        {
+            ResizeGrip.CancelDrag();
+        }
+        SaveOverlayLayout();
+    }
+
+    private void ApplyOverlayScale(double scale, bool persist)
+    {
+        _overlayScale = OverlayLayoutRules.NormalizeScale(scale);
+        foreach (var widget in WidgetPanels)
+        {
+            var effectiveScale = EffectiveWidgetScale(widget);
+            widget.LayoutTransform = new ScaleTransform(effectiveScale, effectiveScale);
+        }
+        MissionToast.LayoutTransform = new ScaleTransform(_overlayScale, _overlayScale);
+        OverlayScaleLabel.Text = OverlayLayoutRules.FormatScale(_overlayScale);
+        ScaleDownButton.IsEnabled = _overlayScale > OverlayLayoutRules.MinimumScale;
+        ScaleResetButton.IsEnabled = Math.Abs(_overlayScale - OverlayLayoutRules.DefaultScale) > 0.001d;
+        ScaleUpButton.IsEnabled = _overlayScale < OverlayLayoutRules.MaximumScale;
+        OverlayScaleRoot.InvalidateMeasure();
+        InvalidateMeasure();
+
+        if (IsLoaded)
+        {
+            UpdateLayout();
+            KeepWidgetsVisible();
+            PositionMap();
+        }
+
+        if (persist)
+        {
+            SaveOverlayLayout();
+        }
+    }
+
+    private void MapShapeButton_Click(object sender, RoutedEventArgs e) =>
+        ApplyMapShape(
+            string.Equals(_mapShape, OverlayLayoutRules.CircleMapShape, StringComparison.Ordinal)
+                ? OverlayLayoutRules.SquareMapShape
+                : OverlayLayoutRules.CircleMapShape,
+            persist: true);
+
+    private void ApplyMapShape(string shape, bool persist)
+    {
+        _mapShape = OverlayLayoutRules.NormalizeMapShape(shape);
+        var isCircle = string.Equals(
+            _mapShape,
+            OverlayLayoutRules.CircleMapShape,
+            StringComparison.Ordinal);
+        MapPanel.CornerRadius = new CornerRadius(4d);
+        MapPanel.Background = isCircle ? Brushes.Transparent : BrushFrom("#0C2020");
+        MapPanel.BorderBrush = isCircle ? Brushes.Transparent : BrushFrom("#783E625B");
+        MapCircleChrome.Visibility = isCircle ? Visibility.Visible : Visibility.Collapsed;
+        MapVisualRoot.Clip = isCircle
+            ? new EllipseGeometry(new Point(152d, 152d), 151d, 151d)
+            : null;
+        MapInfoPanel.HorizontalAlignment = isCircle
+            ? HorizontalAlignment.Center
+            : HorizontalAlignment.Left;
+        MapInfoPanel.Margin = isCircle
+            ? new Thickness(0d, 27d, 0d, 0d)
+            : new Thickness(9d);
+        MapFocusModeButton.HorizontalAlignment = isCircle
+            ? HorizontalAlignment.Center
+            : HorizontalAlignment.Left;
+        MapFocusModeButton.Margin = isCircle
+            ? new Thickness(0d, 0d, 0d, 12d)
+            : new Thickness(10d, 0d, 0d, 10d);
+        MapShapeButton.Content = isCircle ? "MAP · TRÒN" : "MAP · VUÔNG";
+        MapShapeButton.ToolTip = isCircle
+            ? "Đang dùng minimap tròn · bấm để chuyển sang vuông"
+            : "Đang dùng minimap vuông · bấm để chuyển sang tròn";
+        PositionMap();
+
+        if (persist)
+        {
+            SaveOverlayLayout();
+        }
+    }
+
+    private void ConfigureWorkspaceBounds()
+    {
+        var workArea = SystemParameters.WorkArea;
+        Left = workArea.Left;
+        Top = workArea.Top;
+        Width = workArea.Width;
+        Height = workArea.Height;
+        WidgetCanvas.Width = workArea.Width;
+        WidgetCanvas.Height = workArea.Height;
+    }
+
+    private void RestoreWidgetLayout()
+    {
+        var workArea = SystemParameters.WorkArea;
+        var baseLeft = _layoutSettings.Left is { } legacyLeft
+            ? legacyLeft - workArea.Left
+            : Math.Max(12d, WidgetCanvas.Width - 304d * _overlayScale - 24d);
+        var baseTop = _layoutSettings.Top is { } legacyTop
+            ? legacyTop - workArea.Top
+            : 70d;
+        var controlsLeft = Math.Max(12d, baseLeft - 316d * _overlayScale);
+        var defaults = new Dictionary<string, OverlayWidgetPosition>(StringComparer.OrdinalIgnoreCase)
+        {
+            [OverlayLayoutRules.MapWidget] = new() { Left = baseLeft, Top = baseTop },
+            [OverlayLayoutRules.StatsWidget] = new() { Left = baseLeft, Top = baseTop + 312d * _overlayScale },
+            [OverlayLayoutRules.TeamWidget] = new() { Left = baseLeft, Top = baseTop + 490d * _overlayScale },
+            [OverlayLayoutRules.PrimeWidget] = new() { Left = baseLeft, Top = baseTop + 610d * _overlayScale },
+            [OverlayLayoutRules.ControlsWidget] = new() { Left = controlsLeft, Top = baseTop }
+        };
+
+        RestoreWidget(MapPanel, OverlayLayoutRules.MapWidget, defaults);
+        RestoreWidget(StatsPanel, OverlayLayoutRules.StatsWidget, defaults);
+        RestoreWidget(TeamPanel, OverlayLayoutRules.TeamWidget, defaults);
+        RestoreWidget(MissionPanel, OverlayLayoutRules.PrimeWidget, defaults);
+        RestoreWidget(LayoutControls, OverlayLayoutRules.ControlsWidget, defaults);
+        KeepWidgetsVisible();
+    }
+
+    private void RestoreWidget(
+        FrameworkElement widget,
+        string id,
+        IReadOnlyDictionary<string, OverlayWidgetPosition> defaults)
+    {
+        var position = _layoutSettings.Widgets.TryGetValue(id, out var saved)
+            ? saved
+            : defaults[id];
+        MoveWidget(widget, position.Left, position.Top, snap: false);
+    }
+
+    private void MoveWidget(FrameworkElement widget, double left, double top, bool snap)
+    {
+        const double edgeMargin = 10d;
+        const double snapDistance = 10d;
+        var width = ScaledWidth(widget);
+        var height = ScaledHeight(widget);
+        var maxLeft = Math.Max(edgeMargin, WidgetCanvas.Width - width - edgeMargin);
+        var maxTop = Math.Max(edgeMargin, WidgetCanvas.Height - height - edgeMargin);
+        left = Math.Clamp(double.IsFinite(left) ? left : edgeMargin, edgeMargin, maxLeft);
+        top = Math.Clamp(double.IsFinite(top) ? top : edgeMargin, edgeMargin, maxTop);
+
+        if (snap)
+        {
+            left = Snap(left, [edgeMargin, maxLeft], snapDistance);
+            top = Snap(top, [edgeMargin, maxTop], snapDistance);
+            foreach (var other in WidgetPanels.Where(candidate => candidate != widget && candidate.Visibility == Visibility.Visible))
+            {
+                var otherLeft = FiniteCanvasCoordinate(Canvas.GetLeft(other));
+                var otherTop = FiniteCanvasCoordinate(Canvas.GetTop(other));
+                var otherWidth = ScaledWidth(other);
+                var otherHeight = ScaledHeight(other);
+                left = Snap(left, [otherLeft, otherLeft + otherWidth, otherLeft - width, otherLeft + otherWidth - width], snapDistance);
+                top = Snap(top, [otherTop, otherTop + otherHeight, otherTop - height, otherTop + otherHeight - height], snapDistance);
+            }
+        }
+
+        Canvas.SetLeft(widget, Math.Clamp(left, edgeMargin, maxLeft));
+        Canvas.SetTop(widget, Math.Clamp(top, edgeMargin, maxTop));
+    }
+
+    private static double Snap(double value, IEnumerable<double> candidates, double distance)
+    {
+        var closest = candidates.OrderBy(candidate => Math.Abs(candidate - value)).FirstOrDefault(value);
+        return Math.Abs(closest - value) <= distance ? closest : value;
+    }
+
+    private double ScaledWidth(FrameworkElement widget) =>
+        Math.Max(1d, (double.IsNaN(widget.Width) ? widget.ActualWidth : widget.Width) * EffectiveWidgetScale(widget));
+
+    private double ScaledHeight(FrameworkElement widget) =>
+        Math.Max(1d, (double.IsNaN(widget.Height) ? widget.ActualHeight : widget.Height) * EffectiveWidgetScale(widget));
+
+    private static double FiniteCanvasCoordinate(double value) => double.IsFinite(value) ? value : 0d;
+
+    private void KeepWidgetsVisible()
+    {
+        foreach (var widget in WidgetPanels)
+        {
+            MoveWidget(
+                widget,
+                FiniteCanvasCoordinate(Canvas.GetLeft(widget)),
+                FiniteCanvasCoordinate(Canvas.GetTop(widget)),
+                snap: false);
+        }
+    }
+
+    private void KeepOverlayVisible() => KeepWidgetsVisible();
+
+    private void SaveOverlayLayout()
+    {
+        KeepWidgetsVisible();
+        _layoutSettings = OverlayLayoutRules.Normalize(_layoutSettings with
+        {
+            Scale = _overlayScale,
+            MapShape = _mapShape,
+            MissionsVisible = IsWidgetEnabled(OverlayLayoutRules.PrimeWidget),
+            Left = null,
+            Top = null,
+            WidgetVisibility = new Dictionary<string, bool>(
+                _widgetVisibility,
+                StringComparer.OrdinalIgnoreCase),
+            Widgets = new Dictionary<string, OverlayWidgetPosition>(StringComparer.OrdinalIgnoreCase)
+            {
+                [OverlayLayoutRules.MapWidget] = PositionOf(MapPanel),
+                [OverlayLayoutRules.StatsWidget] = PositionOf(StatsPanel),
+                [OverlayLayoutRules.TeamWidget] = PositionOf(TeamPanel),
+                [OverlayLayoutRules.PrimeWidget] = PositionOf(MissionPanel),
+                [OverlayLayoutRules.ControlsWidget] = PositionOf(LayoutControls)
+            }
+        });
+        _layoutSettingsStore.Save(_layoutSettings);
+    }
+
+    private OverlayWidgetPosition PositionOf(FrameworkElement widget) => new()
+    {
+        Left = FiniteCanvasCoordinate(Canvas.GetLeft(widget)),
+        Top = FiniteCanvasCoordinate(Canvas.GetTop(widget)),
+        Scale = WidgetScale(widget)
+    };
+
+    private void ResetWidgetLayoutButton_Click(object sender, RoutedEventArgs e)
+    {
+        _layoutSettings = _layoutSettings with
+        {
+            Left = null,
+            Top = null,
+            Widgets = new Dictionary<string, OverlayWidgetPosition>(StringComparer.OrdinalIgnoreCase)
+        };
+        _widgetScales.Clear();
+        foreach (var widget in ResizableWidgetPanels)
+        {
+            _widgetScales[WidgetId(widget)] = OverlayLayoutRules.DefaultScale;
+        }
+        ApplyOverlayScale(_overlayScale, persist: false);
+        RestoreWidgetLayout();
+        SaveOverlayLayout();
+    }
+
+    private void LockButton_Click(object sender, RoutedEventArgs e) => SetClickThrough(true);
+
+    private void OpenMapNotesFallbackButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (HasCurrentProFeatures)
+            ToggleMapNotesWindow();
+        else
+            MessageBox.Show(this, "Mốc bản đồ là tính năng Pro. Hãy kích hoạt Pro để sử dụng Alt+M.",
+                "Mở bản đồ mốc", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private BitmapImage? _baseMapImage;
+    private BitmapImage? _waterMapImage;
+
+    private static BitmapImage LoadBitmapResource(Uri resourceUri)
+    {
+        var resource = Application.GetResourceStream(resourceUri)
+                       ?? throw new InvalidOperationException($"Map resource not found: {resourceUri}");
+        using var stream = resource.Stream;
+        var image = new BitmapImage();
+        image.BeginInit();
+        image.CacheOption = BitmapCacheOption.OnLoad;
+        image.StreamSource = stream;
+        image.EndInit();
+        image.Freeze();
+        return image;
+    }
+
+    private void ApplyWaterMapImage()
+    {
+        if (_baseMapImage is null || _waterMapImage is null)
+            return;
+        MapImage.Source = _mapLayerPreferences.Water ? _waterMapImage : _baseMapImage;
+        _mapLayerGeometryDirty = true;
+        PositionMap();
+    }
+
+    private void MapLayersButton_Click(object sender, RoutedEventArgs e)
+    {
+        _mapLayerInspectorOpen = !_mapLayerInspectorOpen;
+        UpdateMapLayersCommandState();
+        MapLayerInspector.Visibility = _mapLayerInspectorOpen && !_clickThrough
+            ? Visibility.Visible : Visibility.Collapsed;
+        if (_mapLayerInspectorOpen) UpdateMapLayerControls();
+    }
+
+    private void CloseMapLayerInspectorButton_Click(object sender, RoutedEventArgs e)
+    {
+        _mapLayerInspectorOpen = false;
+        UpdateMapLayersCommandState();
+        MapLayerInspector.Visibility = Visibility.Collapsed;
+    }
+
+    private void UpdateMapLayersCommandState()
+    {
+        if (MapLayersButton is null)
+            return;
+        MapLayersButton.Background = BrushFrom(_mapLayerInspectorOpen ? "#F03D6748" : "#E31A3827");
+        MapLayersButton.BorderBrush = BrushFrom(_mapLayerInspectorOpen ? "#C1B9E39C" : "#6D4F9268");
+        MapLayersButton.Foreground = BrushFrom(_mapLayerInspectorOpen ? "#FFFFFF" : "#DDF8E5");
+    }
+
+    private void ShortcutSettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new ShortcutSettingsWindow(_shortcutSettings)
+        {
+            Owner = this
+        };
+        if (dialog.ShowDialog() != true || dialog.SelectedSettings is not { } requested)
+        {
+            return;
+        }
+
+        if (_shortcutRegistrationManager is null)
+        {
+            dialog.SetExternalError("Overlay chưa sẵn sàng đăng ký phím tắt.");
+            return;
+        }
+
+        var result = _shortcutRegistrationManager.TryApply(requested);
+        if (!result.Success)
+        {
+            _shortcutSettings = result.ActiveSettings;
+            RefreshShortcutCopy();
+            if (_shortcutRegistrationManager.HasCompleteRegistration)
+            {
+                _shortcutSettingsStore.TrySave(_shortcutSettings, out _);
+            }
+            SetClickThrough(true);
+            MessageBox.Show(
+                this,
+                result.FriendlyError + Environment.NewLine
+                    + (_shortcutRegistrationManager.HasCompleteRegistration
+                        ? "Các action khác vẫn hoạt động; action bị trùng đã dùng tổ hợp dự phòng."
+                        : "Bộ phím cũ cũng đang bị chiếm; overlay đã khóa xuyên chuột để giữ an toàn."),
+                "Không thể đổi phím tắt",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return;
+        }
+
+        if (!_shortcutSettingsStore.TrySave(requested, out var saveError))
+        {
+            _shortcutRegistrationManager.TryApply(_shortcutSettings);
+            SetClickThrough(true);
+            MessageBox.Show(
+                this,
+                saveError ?? "Không thể lưu phím tắt. Các phím cũ đã được khôi phục.",
+                "Không thể lưu phím tắt",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return;
+        }
+
+        _shortcutSettings = requested;
+        RefreshShortcutCopy();
+    }
+
+    private void ShowShortcutRegistrationWarning(ShortcutRegistrationResult result)
+    {
+        if (!IsVisible) return;
+        var choice = MessageBox.Show(
+            this,
+            result.FriendlyError + Environment.NewLine
+                + (result.Statuses.Any(status => status.Registered)
+                    ? "Các phím còn lại vẫn hoạt động độc lập. Mở cài đặt để đổi action bị trùng?"
+                    : "Overlay vẫn ở chế độ xuyên chuột an toàn. Mở cài đặt để chọn tổ hợp khác?"),
+            "Phím tắt đang bị trùng",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning);
+        if (choice == MessageBoxResult.Yes)
+        {
+            ShortcutSettingsButton_Click(this, new RoutedEventArgs());
+        }
+    }
+
+    private void RefreshShortcutCopy()
+    {
+        LockButton.ToolTip =
+            $"Thoát Edit Mode và bật xuyên chuột · {_shortcutSettings.EditMode}";
+    }
+
+    private void RebuildShortcutRegistration(bool includeMapNotes)
+    {
+        _shortcutRegistrationManager?.Dispose();
+        _shortcutRegistrationManager = new ShortcutRegistrationManager(
+            new WindowInteropHelper(this).Handle,
+            includeMapNotes);
+        var result = _shortcutRegistrationManager.RegisterInitial(_shortcutSettings);
+        _shortcutSettings = result.ActiveSettings;
+        RefreshShortcutCopy();
+        if (!result.Success)
+        {
+            SetClickThrough(true);
+            ShowShortcutRegistrationWarning(result);
+        }
+    }
+
+    private void HomeButton_Click(object sender, RoutedEventArgs e)
+    {
+        _shortcutRegistrationManager?.Dispose();
+        _shortcutRegistrationManager = null;
+        var home = new HomeWindow();
+        Application.Current.MainWindow = home;
+        home.Show();
+        Close();
+    }
+
+    private void SetClickThrough(bool enabled)
+    {
+        if (enabled)
+        {
+            CancelMapPan();
+            FinishWidgetResize(persist: true);
+            FinishOverlayResize();
+            if (_draggedWidget is not null)
+            {
+                _draggedWidget.ReleaseMouseCapture();
+                _draggedWidget = null;
+                SaveOverlayLayout();
+            }
+        }
+
+        var handle = new WindowInteropHelper(this).Handle;
+        var style = GetWindowLong(handle, GwlExStyle);
+        style = enabled ? style | WsExTransparent | WsExNoActivate : style & ~(WsExTransparent | WsExNoActivate);
+        SetWindowLong(handle, GwlExStyle, style);
+        _clickThrough = enabled;
+        StatsMoveBadge.Visibility = enabled ? Visibility.Collapsed : Visibility.Visible;
+        TeamMoveBadge.Visibility = enabled ? Visibility.Collapsed : Visibility.Visible;
+        MissionMoveBadge.Visibility = enabled ? Visibility.Collapsed : Visibility.Visible;
+        MapZoomControls.Visibility = enabled ? Visibility.Collapsed : Visibility.Visible;
+        _mapLayerInspectorOpen = false;
+        foreach (var grip in WidgetResizeGrips)
+        {
+            grip.Visibility = enabled ? Visibility.Collapsed : Visibility.Visible;
+        }
+        foreach (var widget in WidgetPanels.Where(widget => widget != LayoutControls))
+        {
+            widget.Cursor = enabled ? Cursors.Arrow : Cursors.SizeAll;
+        }
+        LockButtonLabel.Text = enabled ? "ĐÃ KHÓA" : "KHÓA";
+        UpdateMapLayersCommandState();
+        RefreshOptionalWidgetVisibility();
+        if (!enabled)
+        {
+            Activate();
+        }
+
+        Dispatcher.BeginInvoke(
+            () =>
+            {
+                RefreshWindowSizeToContent();
+                KeepOverlayVisible();
+                PositionMap();
+            },
+            DispatcherPriority.Loaded);
+    }
+
+    private void RefreshWindowSizeToContent()
+    {
+        OverlayScaleRoot.InvalidateMeasure();
+        InvalidateMeasure();
+        UpdateLayout();
+        KeepWidgetsVisible();
+    }
+
+    private void RefreshOptionalWidgetVisibility()
+    {
+        var editMode = !_clickThrough;
+        MapPanel.Visibility = BlockVisibility(
+            OverlayLayoutRules.MapWidget,
+            dataAvailable: true,
+            editMode);
+        StatsPanel.Visibility = BlockVisibility(
+            OverlayLayoutRules.StatsWidget,
+            dataAvailable: true,
+            editMode);
+        TeamPanel.Visibility = BlockVisibility(
+            OverlayLayoutRules.TeamWidget,
+            _pendingTeamState.HasActiveSession,
+            editMode);
+        MissionPanel.Visibility = BlockVisibility(
+            OverlayLayoutRules.PrimeWidget,
+            _hasMissions,
+            editMode);
+
+        var editControlsVisible = OverlayWidgetVisibilityPolicy.AreEditControlsVisible(
+            _hudVisible,
+            editMode);
+        EditToolbar.Visibility = editControlsVisible
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        LayoutControls.Visibility = editControlsVisible
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        MapLayerInspector.Visibility = editControlsVisible && _mapLayerInspectorOpen
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+        if (MapPanel.Visibility != Visibility.Visible)
+        {
+            CancelMapPan();
+            _mapScreenBounds = null;
+        }
+        RefreshWidgetVisibilityToggleStates();
+    }
+
+    private Visibility BlockVisibility(string widgetId, bool dataAvailable, bool editMode) =>
+        OverlayWidgetVisibilityPolicy.IsBlockVisible(
+            _hudVisible,
+            IsWidgetEnabled(widgetId),
+            dataAvailable,
+            editMode)
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+    private bool IsWidgetEnabled(string widgetId) =>
+        _widgetVisibility.TryGetValue(widgetId, out var enabled) && enabled;
+
+    private void ToggleWidgetPreference(string widgetId) =>
+        SetWidgetPreference(widgetId, !IsWidgetEnabled(widgetId));
+
+    private void SetWidgetPreference(string widgetId, bool enabled)
+    {
+        if (!OverlayLayoutRules.IsConfigurableWidget(widgetId))
+        {
+            return;
+        }
+
+        _widgetVisibility[widgetId] = enabled;
+        RefreshOptionalWidgetVisibility();
+        RefreshWindowSizeToContent();
+        KeepOverlayVisible();
+        SaveOverlayLayout();
+        if (MapPanel.Visibility == Visibility.Visible)
+        {
+            Dispatcher.BeginInvoke(PositionMap, DispatcherPriority.Loaded);
+        }
+        else
+        {
+            _mapScreenBounds = null;
+        }
+    }
+
+    private void WidgetVisibilityToggle_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is ToggleButton { Tag: string widgetId } toggle)
+        {
+            SetWidgetPreference(widgetId, toggle.IsChecked == true);
+        }
+    }
+
+    private void ShowAllWidgetsButton_Click(object sender, RoutedEventArgs e)
+    {
+        foreach (var widgetId in new[]
+                 {
+                     OverlayLayoutRules.MapWidget,
+                     OverlayLayoutRules.StatsWidget,
+                     OverlayLayoutRules.TeamWidget,
+                     OverlayLayoutRules.PrimeWidget
+                 })
+        {
+            _widgetVisibility[widgetId] = true;
+        }
+        RefreshOptionalWidgetVisibility();
+        RefreshWindowSizeToContent();
+        KeepOverlayVisible();
+        SaveOverlayLayout();
+        Dispatcher.BeginInvoke(PositionMap, DispatcherPriority.Loaded);
+    }
+
+    private void RefreshWidgetVisibilityToggleStates()
+    {
+        if (MapVisibilityToggle is null)
+        {
+            return;
+        }
+        MapVisibilityToggle.IsChecked = IsWidgetEnabled(OverlayLayoutRules.MapWidget);
+        StatsVisibilityToggle.IsChecked = IsWidgetEnabled(OverlayLayoutRules.StatsWidget);
+        TeamVisibilityToggle.IsChecked = IsWidgetEnabled(OverlayLayoutRules.TeamWidget);
+        PrimeVisibilityToggle.IsChecked = IsWidgetEnabled(OverlayLayoutRules.PrimeWidget);
+    }
+
+    private IntPtr WindowMessageHook(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (message == WmInput && _mapPanActive && RawMouseInput.TryReadDelta(lParam, out var delta))
+        {
+            MoveMapPan(delta);
+        }
+        else if (message == WmHotkey && wParam.ToInt32() == ShortcutSettingsManager.EditHotkeyId)
+        {
+            if (!_clickThrough
+                || OverlayWidgetVisibilityPolicy.CanEnterEditMode(_hudVisible))
+            {
+                SetClickThrough(!_clickThrough);
+            }
+            handled = true;
+        }
+        else if (message == WmHotkey && wParam.ToInt32() == ShortcutSettingsManager.ToggleMissionsHotkeyId)
+        {
+            ToggleMissions();
+            handled = true;
+        }
+        else if (message == WmHotkey && wParam.ToInt32() == ShortcutSettingsManager.ToggleHudHotkeyId)
+        {
+            ToggleHud();
+            handled = true;
+        }
+        else if (message == WmHotkey && wParam.ToInt32() == ShortcutSettingsManager.MapNotesHotkeyId)
+        {
+            if (HasCurrentProFeatures)
+            {
+                ToggleMapNotesWindow();
+            }
+            handled = true;
+        }
+        else if (message == WmHotkey && wParam.ToInt32() == ShortcutSettingsManager.MutationGuideHotkeyId)
+        {
+            ToggleMutationGuide();
+            handled = true;
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private void MinimizeButton_Click(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
+
+    private void Window_StateChanged(object? sender, EventArgs e) =>
+        Dispatcher.BeginInvoke(PositionMap, DispatcherPriority.Loaded);
+
+    private void CloseButton_Click(object sender, RoutedEventArgs e) => Close();
+
+    private async void Window_Closed(object? sender, EventArgs e)
+    {
+        SaveOverlayLayout();
+        CloseMutationGuide();
+        DetachMapNotes();
+        _mouseShortcutActivationTimer?.Stop();
+        _mouseShortcutActivationTimer = null;
+        DisableRawMouseInput();
+        if (_uiRenderTimer is not null)
+        {
+            _uiRenderTimer.Stop();
+            _uiRenderTimer.Tick -= UiRenderTimer_Tick;
+            _uiRenderTimer = null;
+        }
+        _proFeatureExpiryTimer?.Stop();
+        _proFeatureExpiryTimer = null;
+        DetachTeamOverlay();
+        _shutdown.Cancel();
+        if (_telemetryWatchTask is not null)
+        {
+            await _telemetryWatchTask;
+        }
+
+        if (_telemetrySession is not null)
+        {
+            await _telemetrySession.DisposeAsync();
+        }
+        if (!_remotePlayerSourceOwnedBySession && _remotePlayerSource is not null)
+        {
+            await _remotePlayerSource.DisposeAsync();
+        }
+
+        _shortcutRegistrationManager?.Dispose();
+        _shortcutRegistrationManager = null;
+        if (_mouseShortcuts is not null)
+        {
+            _mouseShortcuts.CanStartMapPan = null;
+            _mouseShortcuts.ZoomInRequested -= ZoomInMap;
+            _mouseShortcuts.ZoomOutRequested -= ZoomOutMap;
+            _mouseShortcuts.ToggleMapRequested -= ToggleMap;
+            _mouseShortcuts.MapPanStarted -= StartMapPan;
+            _mouseShortcuts.MapPanMoved -= MoveMapPan;
+            _mouseShortcuts.MapPanEnded -= EndMapPan;
+            _mouseShortcuts.FollowMapRequested -= FollowPlayerMap;
+            _mouseShortcuts.Dispose();
+        }
+        _windowSource?.RemoveHook(WindowMessageHook);
+        _httpClient.Dispose();
+        _shutdown.Dispose();
+        await DisposeDiagnosticsWriterAsync();
+    }
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    private static extern int GetWindowLong(IntPtr hWnd, int index);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
+    private static extern int SetWindowLong(IntPtr hWnd, int index, int newStyle);
+
+    private sealed record MapScreenBounds(double Left, double Top, double Right, double Bottom)
+    {
+        public double Width => Right - Left;
+        public double Height => Bottom - Top;
+
+        public bool Contains(GlobalMousePoint point) =>
+            point.X >= Left && point.X < Right && point.Y >= Top && point.Y < Bottom;
+    }
+}

@@ -1,0 +1,68 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\TheIsleOverlay.App\TheIsleOverlay.App.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\src\TheIsleOverlay.App\App.xaml"
+             Link="TestAssets\App.xaml"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\HomeWindow.xaml"
+             Link="TestAssets\HomeWindow.xaml"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\HomeWindow.xaml.cs"
+             Link="TestAssets\HomeWindow.xaml.cs"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\HomeWindow.Pro.cs"
+             Link="TestAssets\HomeWindow.Pro.cs"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\HomeWindow.IslePilot.cs"
+             Link="TestAssets\HomeWindow.IslePilot.cs"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\MainWindow.xaml"
+             Link="TestAssets\MainWindow.xaml"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\MainWindow.Mutation.cs"
+             Link="TestAssets\MainWindow.Mutation.cs"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\MapNotesWindow.xaml"
+             Link="TestAssets\MapNotesWindow.xaml"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\ProSteamLoginWindow.xaml"
+             Link="TestAssets\ProSteamLoginWindow.xaml"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\ProPromotionWindow.xaml"
+             Link="TestAssets\ProPromotionWindow.xaml"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\GuideWindow.xaml"
+             Link="TestAssets\GuideWindow.xaml"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\ReleaseHighlightsWindow.xaml"
+             Link="TestAssets\ReleaseHighlightsWindow.xaml"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\TheIsleOverlay.App\NpcapRequiredWindow.xaml"
+             Link="TestAssets\NpcapRequiredWindow.xaml"
+             CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

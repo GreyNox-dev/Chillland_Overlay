@@ -1,0 +1,240 @@
+using System.Net.Http;
+using System.Windows;
+using System.Windows.Interop;
+using TheIsleOverlay.Core;
+using TheIsleOverlay.IslePilot;
+using TheIsleOverlay.LocalTelemetry;
+
+namespace TheIsleOverlay.App;
+
+public partial class HomeWindow
+{
+    private readonly IslePilotCredentialStore _islePilotCredentialStore = new(
+        AppPaths.IslePilotCredential);
+    private IslePilotOverlayAuthResult? _islePilotCredentials;
+    private bool _islePilotConnecting;
+
+    private async void SteamLoginPanel_Loaded(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            _islePilotCredentials = await _islePilotCredentialStore.LoadAsync(_shutdown.Token);
+            ApplySteamLoginState(_islePilotCredentials);
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            SourceStatusLabel.Text = $"Không đọc được phiên Steam đã lưu: {FriendlyError(exception)}";
+            ApplySteamLoginState(null);
+        }
+    }
+
+    private async void SteamLoginButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!EnsureMapLaunchAvailable()
+            || _islePilotConnecting
+            || _gachaConnecting
+            || _connecting
+            || !_proAccessInitialized
+            || _proAccessLoading)
+        {
+            return;
+        }
+
+        if (!EnsureLocalCaptureAvailable())
+        {
+            return;
+        }
+
+        _islePilotConnecting = true;
+        RefreshMapLaunchControls();
+        try
+        {
+            // One obvious map action for users: prefer a first-party server
+            // feed only after it proves this account has an active dinosaur;
+            // otherwise continue with the default IslePilot session flow.
+            if (await TryOpenActiveOriginFromUnifiedMapAsync())
+            {
+                return;
+            }
+
+            if (await TryOpenActiveGachaFromUnifiedMapAsync())
+            {
+                return;
+            }
+
+            var credentials = _islePilotCredentials
+                ?? await _islePilotCredentialStore.LoadAsync(_shutdown.Token);
+            if (credentials is not null)
+            {
+                SourceStatusLabel.Text = "ĐANG XÁC MINH PHIÊN ISLEPILOT…";
+                var savedState = await ValidateIslePilotCredentialsAsync(credentials);
+                if (savedState == IslePilotOverlayAuthValidationState.Invalid)
+                {
+                    _islePilotCredentialStore.Clear();
+                    credentials = null;
+                    _islePilotCredentials = null;
+                    ApplySteamLoginState(null);
+                    SourceStatusLabel.Text = "Phiên đã hết hạn. Hãy đăng nhập Steam lại.";
+                }
+            }
+
+            if (credentials is null)
+            {
+                var loginWindow = new IslePilotSteamLoginWindow { Owner = this };
+                if (loginWindow.ShowDialog() != true || loginWindow.Credentials is null)
+                {
+                    SourceStatusLabel.Text = "Chưa đăng nhập Steam. Không có token nào được lưu.";
+                    return;
+                }
+
+                credentials = loginWindow.Credentials;
+                SourceStatusLabel.Text = "ĐÃ NHẬN PHIÊN · ĐANG XÁC MINH /ME…";
+                var newState = await ValidateIslePilotCredentialsAsync(credentials);
+                if (newState == IslePilotOverlayAuthValidationState.Invalid)
+                {
+                    SourceStatusLabel.Text = "IslePilot từ chối phiên vừa đăng nhập. Hãy thử lại.";
+                    return;
+                }
+
+                await _islePilotCredentialStore.SaveAsync(credentials, _shutdown.Token);
+                _islePilotCredentials = credentials;
+                ApplySteamLoginState(credentials);
+            }
+
+            if (string.IsNullOrWhiteSpace(credentials.PlayerCookie))
+            {
+                var enriched = await AttachSavedIslePilotCookieAsync(credentials);
+                if (!Equals(enriched, credentials))
+                {
+                    credentials = enriched;
+                    await _islePilotCredentialStore.SaveAsync(credentials, _shutdown.Token);
+                    _islePilotCredentials = credentials;
+                }
+            }
+
+            var proPresentation = HomeProPresentationPolicy.Evaluate(
+                _proAccess,
+                DateTimeOffset.UtcNow);
+            if (proPresentation.HasCurrentProAccess
+                && _proAccess.AgentReady
+                && _proAccess.SteamId64 is { Length: 17 } proSteamId64)
+            {
+                _ = await EnsureIslePilotVoiceCredentialsAsync(proSteamId64);
+            }
+
+            SourceStatusLabel.Text = "ĐANG KHỞI TẠO ISLEPILOT REALTIME…";
+            await OpenIslePilotOverlayAsync(credentials);
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            SourceStatusLabel.Text = $"Không kết nối được IslePilot: {FriendlyError(exception)}";
+        }
+        finally
+        {
+            _islePilotConnecting = false;
+            RefreshMapLaunchControls();
+        }
+    }
+
+    private void LogoutSteamButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_islePilotConnecting)
+        {
+            return;
+        }
+
+        _islePilotCredentialStore.Clear();
+        _islePilotVoiceCredentialStore.Clear();
+        _islePilotCredentials = null;
+        ApplySteamLoginState(null);
+        SourceStatusLabel.Text = "Đã đăng xuất IslePilot và xóa token đã lưu.";
+    }
+
+    private async Task<IslePilotOverlayAuthValidationState> ValidateIslePilotCredentialsAsync(
+        IslePilotOverlayAuthResult credentials)
+    {
+        using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+        return await IslePilotOverlayAuthService.ValidateAsync(
+            httpClient,
+            credentials,
+            _shutdown.Token);
+    }
+
+    private async Task OpenIslePilotOverlayAsync(IslePilotOverlayAuthResult credentials)
+    {
+        var session = new AuthenticationInvalidatingTelemetrySession(
+            IslePilotRealtimeSession.Create(new IslePilotOverlayOptions
+            {
+                OverlayToken = credentials.OverlayToken,
+                PlayerCookie = credentials.PlayerCookie
+            }),
+            _islePilotCredentialStore.Clear);
+
+        try
+        {
+            var overlay = new MainWindow(
+                new LocalPositionTelemetrySession(
+                    session,
+                    App.CurrentApp.TakeLocalTelemetrySource(),
+                    "ISLEPILOT",
+                    TakeProPlayerSource()),
+                "ISLEPILOT",
+                ProFeatureAccessGrant.FromSnapshot(_proAccess, DateTimeOffset.UtcNow));
+            Application.Current.MainWindow = overlay;
+            overlay.Show();
+            Close();
+        }
+        catch
+        {
+            await session.DisposeAsync();
+            throw;
+        }
+    }
+
+    private async Task<IslePilotOverlayAuthResult> AttachSavedIslePilotCookieAsync(
+        IslePilotOverlayAuthResult credentials)
+    {
+        try
+        {
+            var handle = new WindowInteropHelper(this).Handle;
+            var playerCookie = await IslePilotPlayerCookieReader.ReadFromProfileAsync(
+                handle,
+                _shutdown.Token);
+            return string.IsNullOrWhiteSpace(playerCookie)
+                ? credentials
+                : credentials with { PlayerCookie = playerCookie };
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return credentials;
+        }
+    }
+
+    private void ApplySteamLoginState(IslePilotOverlayAuthResult? credentials)
+    {
+        var authenticated = credentials is not null;
+        if (authenticated)
+        {
+            SuggestTeamDisplayName(credentials!.SteamId[^4..]);
+        }
+
+        SteamAccountLabel.Text = authenticated
+            ? $"STEAM · ••••{credentials!.SteamId[^4..]}"
+            : "CHƯA ĐĂNG NHẬP STEAM";
+        SteamLoginDetailLabel.Text = authenticated
+            ? "GPS trực tiếp · Dino stats qua phiên IslePilot đã mã hóa"
+            : "Đăng nhập Steam để đồng bộ dino stats từ IslePilot";
+        LogoutSteamButton.Visibility = authenticated ? Visibility.Visible : Visibility.Collapsed;
+        RefreshMapLaunchControls();
+    }
+}

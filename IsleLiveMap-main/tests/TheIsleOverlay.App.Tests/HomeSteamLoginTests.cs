@@ -1,0 +1,167 @@
+using System.IO;
+using System.Xml.Linq;
+
+namespace TheIsleOverlay.App.Tests;
+
+public sealed class HomeSteamLoginTests
+{
+    [Fact]
+    public void Home_UsesIslePilotStatsWithDirectGpsAndRemovesWebsiteSourceBlocks()
+    {
+        var document = XDocument.Load(Path.Combine(
+            AppContext.BaseDirectory,
+            "TestAssets",
+            "HomeWindow.xaml"));
+        XName nameAttribute = "{http://schemas.microsoft.com/winfx/2006/xaml}Name";
+
+        XElement Control(string name) => Assert.Single(
+            document.Descendants(),
+            element => string.Equals((string?)element.Attribute(nameAttribute), name, StringComparison.Ordinal));
+
+        var liveMapButton = Control("SteamLoginButton");
+        var liveMapTitle = Control("SteamLoginTitleLabel");
+        var logoutSteamButton = Control("LogoutSteamButton");
+        var logoutProButton = Control("LogoutProButton");
+        Assert.NotEqual("Collapsed", (string?)liveMapButton.Attribute("Visibility"));
+        Assert.Equal("SteamLoginButton_Click", (string?)liveMapButton.Attribute("Click"));
+        Assert.Equal(
+            "SteamLoginPanel_Loaded",
+            (string?)liveMapButton.Parent?.Attribute("Loaded"));
+        Assert.Equal("MỞ LIVE MAP", (string?)liveMapTitle.Attribute("Text"));
+        Assert.Equal("ĐĂNG XUẤT STEAM", (string?)logoutSteamButton.Attribute("Content"));
+        Assert.Equal("LogoutSteamButton_Click", (string?)logoutSteamButton.Attribute("Click"));
+        Assert.Equal("ĐĂNG XUẤT PRO", (string?)logoutProButton.Attribute("Content"));
+        Assert.DoesNotContain(
+            document.Descendants(),
+            element => new[] { "EraSourceButton", "PandoraSourceButton" }
+                .Contains((string?)element.Attribute(nameAttribute), StringComparer.Ordinal));
+        Assert.DoesNotContain(
+            document.Descendants(),
+            element => new[] { "DinoSourceButton", "PremiumSourceButton", "HoHoSourceButton" }
+                .Contains((string?)element.Attribute(nameAttribute), StringComparer.Ordinal));
+
+        var text = document.Descendants()
+            .Select(element => (string?)element.Attribute("Text"))
+            .Where(value => value is not null)
+            .ToArray();
+        Assert.Contains("KÍCH HOẠT LIVE MAP", text);
+        Assert.Contains("KÍCH HOẠT PRO · CHỈ TỪ 28K", text);
+        Assert.Contains("GPS trực tiếp · Tự chọn Origin, Gacha hoặc IslePilot theo server", text);
+        Assert.DoesNotContain("SERVER DÙNG WEBSITE RIÊNG", text);
+    }
+
+    [Fact]
+    public void ProActivationModal_LeadsWithPriceAndSteamIdLicenseTerms()
+    {
+        var document = XDocument.Load(Path.Combine(
+            AppContext.BaseDirectory,
+            "TestAssets",
+            "ProSteamLoginWindow.xaml"));
+
+        var allCopy = string.Join(
+            " ",
+            document.Descendants().SelectMany(element => new[]
+            {
+                (string?)element.Attribute("Text"),
+                (string?)element.Attribute("Content"),
+                (string?)element.Attribute("Title")
+            }));
+
+        Assert.Contains("CHỈ TỪ 28K", allCopy, StringComparison.Ordinal);
+        Assert.Contains("KÍCH HOẠT STEAM / PRO ACCESS", allCopy, StringComparison.Ordinal);
+        Assert.Contains("SteamID64", allCopy, StringComparison.Ordinal);
+        Assert.DoesNotContain("XÁC MINH STEAM / PRO ACCESS", allCopy, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void HomeStartup_DoesNotShowDonateModal()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            AppContext.BaseDirectory,
+            "TestAssets",
+            "HomeWindow.xaml.cs"));
+
+        Assert.DoesNotContain("TryMarkDonatePromptShown", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("new DonateWindow", source, StringComparison.Ordinal);
+        Assert.Null(typeof(HomeWindow).Assembly.GetType("TheIsleOverlay.App.DonateWindow"));
+    }
+
+    [Fact]
+    public void HomeStartup_ShowsDedicatedProPromotionOnlyWithoutCurrentAccess()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            AppContext.BaseDirectory,
+            "TestAssets",
+            "HomeWindow.xaml.cs"));
+
+        Assert.Contains("ShowProPromotionIfNeeded", source, StringComparison.Ordinal);
+        Assert.Contains("new ProPromotionWindow", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ProPromotion_LeadsWithPriceAndLinksToLandingPage()
+    {
+        var document = XDocument.Load(Path.Combine(
+            AppContext.BaseDirectory,
+            "TestAssets",
+            "ProPromotionWindow.xaml"));
+        XName nameAttribute = "{http://schemas.microsoft.com/winfx/2006/xaml}Name";
+
+        XElement Control(string name) => Assert.Single(
+            document.Descendants(),
+            element => string.Equals(
+                (string?)element.Attribute(nameAttribute),
+                name,
+                StringComparison.Ordinal));
+
+        var allCopy = string.Join(
+            " ",
+            document.Descendants().SelectMany(element => new[]
+            {
+                (string?)element.Attribute("Text"),
+                (string?)element.Attribute("Content")
+            }));
+
+        Assert.Contains("CHỈ TỪ 28K", allCopy, StringComparison.Ordinal);
+        Assert.Contains("FULL TẤT CẢ SERVER", allCopy, StringComparison.Ordinal);
+        Assert.Contains("Không phải hack", allCopy, StringComparison.Ordinal);
+        Assert.Equal(
+            "KÍCH HOẠT PRO NGAY",
+            (string?)Control("ActivateProButton").Attribute("Content"));
+        Assert.Contains(
+            document.Descendants(),
+            element => string.Equals(
+                (string?)element.Attribute("Source"),
+                "Assets/ProMapPreview.png",
+                StringComparison.Ordinal));
+        Assert.Equal(
+            "https://isle.klong.dev/",
+            ProPromotionWindow.ProLandingPageUri.AbsoluteUri);
+    }
+
+    [Fact]
+    public void LiveMapHandler_ComposesIslePilotStatsWithLocalPositionAndProEntities()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            AppContext.BaseDirectory,
+            "TestAssets",
+            "HomeWindow.IslePilot.cs"));
+
+        Assert.Contains("IslePilotRealtimeSession.Create", source, StringComparison.Ordinal);
+        Assert.Contains("new LocalPositionTelemetrySession(", source, StringComparison.Ordinal);
+        Assert.Contains("App.CurrentApp.TakeLocalTelemetrySource()", source, StringComparison.Ordinal);
+        Assert.Contains("TakeProPlayerSource()", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Pandora_SourceCapturesTheCompleteHostSessionForItsExpressApi()
+    {
+        var source = TelemetrySourceDefinition.Pandora;
+
+        Assert.Equal("https://islapandora.eu/", source.BaseUri.AbsoluteUri);
+        Assert.Equal("https://islapandora.eu/live-map", source.LoginUri.AbsoluteUri);
+        Assert.Equal(TelemetrySourceKind.Pandora, source.Kind);
+        Assert.True(source.CaptureAllHostCookies);
+        Assert.Same(source, TelemetrySourceDefinition.FromId("pandora"));
+    }
+}
